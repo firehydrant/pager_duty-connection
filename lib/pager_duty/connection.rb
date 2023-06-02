@@ -121,7 +121,7 @@ module PagerDuty
         end
 
         case body
-        when Hash, ::Hashie::Mash
+        when Hash
           OBJECT_KEYS.each do |key|
             object = body[key]
             parse_object_times(object) if object
@@ -180,9 +180,7 @@ module PagerDuty
         conn.request :json
         conn.headers[:accept] = "application/vnd.pagerduty+json;version=#{API_VERSION}"
 
-        # json back, mashify it
         conn.use ParseTimeStrings
-        conn.response :mashify
         conn.response :json
         conn.response :logger, ::Logger.new(STDOUT), bodies: true if debug
 
