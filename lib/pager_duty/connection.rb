@@ -1,23 +1,46 @@
-require 'faraday'
-require 'active_support'
-require 'active_support/core_ext'
-require 'active_support/time_with_zone'
+require "faraday"
+require "hashie"
+require "active_support"
+require "active_support/core_ext"
+require "active_support/time_with_zone"
 
 module PagerDuty
-
   class Connection
     attr_accessor :connection
 
     API_VERSION = 2
     API_PREFIX = "https://api.pagerduty.com/"
 
-    class FileNotFoundError < RuntimeError
+    class FileNotFoundError < RuntimeError; end
+
+    class ApiError < RuntimeError; end
+
+    class RateLimitError < RuntimeError; end
+
+    class UnauthorizedError < RuntimeError; end
+
+    class ForbiddenError < RuntimeError; end
+
+    class RaiseUnauthorizedOn401 < Faraday::Middleware
+      def call(env)
+        response = @app.call(env)
+        if response.status == 401
+          raise PagerDuty::Connection::UnauthorizedError, response.env[:url].to_s
+        else
+          response
+        end
+      end
     end
 
-    class ApiError < RuntimeError
-    end
-
-    class RateLimitError < RuntimeError
+    class RaiseForbiddenOn403 < Faraday::Middleware
+      def call(env)
+        response = @app.call(env)
+        if response.status == 403
+          raise PagerDuty::Connection::ForbiddenError, response.env[:url].to_s
+        else
+          response
+        end
+      end
     end
 
     class RaiseFileNotFoundOn404 < Faraday::Middleware
@@ -34,18 +57,21 @@ module PagerDuty
     class RaiseApiErrorOnNon200 < Faraday::Middleware
       def call(env)
         response = @app.call env
-        unless [200, 201, 204].include?(response.status)
+        if [200, 201, 204].include?(response.status)
+          response
+        else
           url = response.env[:url].to_s
           message = "Got HTTP #{response.status}: #{response.reason_phrase}\nFrom #{url}"
 
-          if error = response.body
-            # TODO May Need to check error.errors too
-            message += "\n#{JSON.parse(error)}"
+          if (error = response.body)
+            begin
+              # TODO May Need to check error.errors too
+              message += "\n#{JSON.parse(error)}"
+            rescue JSON::ParserError
+              message += "\n#{error}"
+            end
           end
-
           raise ApiError, message
-        else
-          response
         end
       end
     end
@@ -64,11 +90,12 @@ module PagerDuty
     class ConvertTimesParametersToISO8601 < Faraday::Middleware
       TIME_KEYS = [:since, :until]
       def call(env)
-
         body = env[:body]
-        TIME_KEYS.each do |key|
-          if body.has_key?(key)
-            body[key] = body[key].iso8601 if body[key].respond_to?(:iso8601)
+        unless body.nil?
+          TIME_KEYS.each do |key|
+            if body.has_key?(key)
+              body[key] = body[key].iso8601 if body[key].respond_to?(:iso8601)
+            end
           end
         end
 
@@ -77,7 +104,7 @@ module PagerDuty
     end
 
     class ParseTimeStrings < Faraday::Middleware
-      TIME_KEYS = %w(
+      TIME_KEYS = %w[
         at
         created_at
         created_on
@@ -88,9 +115,9 @@ module PagerDuty
         start
         started_at
         start_time
-      )
+      ]
 
-      OBJECT_KEYS = %w(
+      OBJECT_KEYS = %w[
         alert
         entry
         incident
@@ -99,21 +126,17 @@ module PagerDuty
         note
         override
         service
-      )
+      ]
 
-      NESTED_COLLECTION_KEYS = %w(
+      NESTED_COLLECTION_KEYS = %w[
         acknowledgers
         assigned_to
         pending_actions
-      )
+      ]
 
       def on_complete(env)
-        if env.body
-          env.body = parse(env.body)
-        end
+        parse(env[:body])
       end
-
-      private
 
       def parse(body)
         if body.respond_to?(:empty?) && body.empty?
@@ -151,12 +174,29 @@ module PagerDuty
       end
 
       def parse_object_times(object)
-        time = Time.zone ? Time.zone : Time
+        time = Time.zone || Time
 
         TIME_KEYS.each do |key|
           if object.has_key?(key) && object[key].present?
             object[key] = time.parse(object[key])
           end
+        end
+      end
+    end
+
+    class Mashify < Faraday::Middleware
+      def on_complete(env)
+        env[:body] = parse(env[:body])
+      end
+
+      def parse(body)
+        case body
+        when Hash
+          ::Hashie::Mash.new(body)
+        when Array
+          body.map { |item| parse(item) }
+        else
+          body
         end
       end
     end
@@ -167,11 +207,14 @@ module PagerDuty
 
         case token_type
         when :Token
-          conn.request :authorization, "Token", "token=#{token}"
+          if faraday_v1?
+            conn.request :token_auth, token
+          else
+            conn.request :authorization, "Token", token
+          end
         when :Bearer
           conn.request :authorization, "Bearer", token
-        else
-          raise ArgumentError, "invalid token_type: #{token_type.inspect}"
+        else raise ArgumentError, "invalid token_type: #{token_type.inspect}"
         end
 
         conn.use ConvertTimesParametersToISO8601
@@ -181,8 +224,9 @@ module PagerDuty
         conn.headers[:accept] = "application/vnd.pagerduty+json;version=#{API_VERSION}"
 
         conn.use ParseTimeStrings
+        conn.use Mashify
         conn.response :json
-        conn.response :logger, ::Logger.new(STDOUT), bodies: true if debug
+        conn.response :logger, ::Logger.new($stdout), bodies: true if debug
 
         # Because Faraday::Middleware executes in reverse order of
         # calls to conn.use, status code error handling goes at the
@@ -190,12 +234,20 @@ module PagerDuty
         conn.use RaiseApiErrorOnNon200
         conn.use RaiseFileNotFoundOn404
         conn.use RaiseRateLimitOn429
+        conn.use RaiseForbiddenOn403
+        conn.use RaiseUnauthorizedOn401
 
-        conn.adapter  Faraday.default_adapter
+        conn.adapter Faraday.default_adapter
       end
     end
 
     def get(path, request = {})
+      # The run_request() method body argument defaults to {}, which is incorrect for GET requests
+      # https://github.com/technicalpickles/pager_duty-connection/issues/56
+      # NOTE: PagerDuty support discourages GET requests with bodies, but not throwing an ArgumentError to prevent breaking
+      #   corner-case implementations.
+      request[:body] = nil if !request[:body]
+
       # paginate anything being 'get'ed, because the offset/limit isn't intuitive
       request[:query_params] = {} if !request[:query_params]
       page = request[:query_params].fetch(:page, 1).to_i
@@ -203,6 +255,7 @@ module PagerDuty
       offset = (page - 1) * limit
 
       query_params = request[:query_params].merge(offset: offset, limit: limit)
+      query_params.delete(:page)
 
       run_request(:get, path, **request.merge(query_params: query_params))
     end
@@ -221,8 +274,16 @@ module PagerDuty
 
     private
 
+    def faraday_v1?
+      faraday_version < Gem::Version.new("2")
+    end
+
+    def faraday_version
+      @faraday_version ||= Gem.loaded_specs["faraday"].version
+    end
+
     def run_request(method, path, body: {}, headers: {}, query_params: {})
-      path = path.gsub(/^\//, '') # strip leading slash, to make sure relative things happen on the connection
+      path = path.gsub(/^\//, "") # strip leading slash, to make sure relative things happen on the connection
 
       connection.params = query_params
       response = connection.run_request(method, path, body, headers)
